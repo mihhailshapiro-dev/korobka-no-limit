@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+  <title>Doodle Jump — Vaporwave Edition (Multiplayer)</title>
+  <style>
+    :root {
+      --fg: #e2e8f0;
+      --muted: #94a3b8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body { margin:0; height:100%; overflow:hidden; color:var(--fg); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; }
+    .wrap { height:100%; display:grid; place-items:center; background:#0b1020; }
+    .stage { position:relative; width:min(860px,96vw); height:min(1200px,calc(96vh - 24px)); }
+    canvas { width:100%; height:100%; display:block; border-radius:18px; outline:1px solid rgba(255,255,255,.15); box-shadow: 0 20px 60px rgba(0,0,0,.6), inset 0 1px 0 rgba(255,255,255,.06); background:#0a0f25; }
+    .hud { position:absolute; inset:0; pointer-events:none; }
+    .label { position:absolute; top:10px; left:10px; background:rgba(0,0,0,.35); border:1px solid rgba(255,255,255,.2); padding:6px 10px; border-radius:10px; font-size:12px; backdrop-filter: blur(6px); }
+    .bar { position:absolute; top:10px; right:10px; width:200px; height:8px; border-radius:999px; background: rgba(255,255,255,.18); overflow:hidden; }
+    .bar > i { display:block; width:0%; height:100%; background: linear-gradient(90deg,#22c55e,#60a5fa); }
+    .legend { position:absolute; top:30px; right:10px; font-size:11px; color:var(--muted); text-align:right; }
+    .touch { position:absolute; inset:0; pointer-events:none; }
+    .btn { position:absolute; bottom:10px; width:28%; height:26%; max-height:220px; border-radius:16px; background: rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.2); pointer-events:auto; display:grid; place-items:center; user-select:none; touch-action:none; font-weight:700; color:#e2e8f0; }
+    .btn:active { transform: scale(.98); }
+    .btn-left { left:10px; }
+    .btn-right { right:10px; }
+    .btn-pause { right:50%; transform:translateX(50%); width:120px; height:46px; bottom:10px; border-radius:999px; font-size:13px; }
+    /* Скрываем сенсорные кнопки на ПК */
+    @media (pointer: fine) {
+      .btn { display:none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="stage">
+      <canvas id="game" width="360" height="560" aria-label="Игровое поле"></canvas>
+      <div class="hud">
+        <div class="label" id="status">WS: offline</div>
+        <div class="bar"><i id="raceBar"></i></div>
+        <div class="legend">Ты — розовый неон · Призраки — бледные случайные · Серые — другие игроки</div>
+      </div>
+      <div class="touch">
+        <div class="btn btn-left" id="btnLeft">◀</div>
+        <div class="btn btn-right" id="btnRight">▶</div>
+        <div class="btn btn-pause" id="btnPause">Пауза</div>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ====== Константы ======
+const DPR = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let W=360, H=560;
+
+const GRAVITY = 1600;
+const JUMP_SPEED = 800;
+const SUPER_JUMP = 1250;
+const MOVE_ACCEL = 2200;
+const MOVE_MAX_SPEED = 300;
+const FRICTION = 1400;
+const PLATFORM_WIDTH = 70;
+const PLATFORM_HEIGHT = 12;
+const PLATFORM_GAP_MIN = 60;
+const PLATFORM_GAP_MAX = 110;
+const PLATFORM_SAFE_STARTS = 8;
+const TARGET_HEIGHT = 2200;
+
+const STATE = { READY:'READY', RUN:'RUN', PAUSE:'PAUSE', OVER:'OVER' };
+let gameState = STATE.READY;
+
+// Камера и счёт
+let cameraY = 0;
+let bestHeight = 0;
+
+// Игрок (неоново-розовый)
+const player = { x:0,y:0,w:32,h:36,vx:0,vy:0,facing:1, glowPhase:0 };
+
+// Призрак предыдущего забега
+let ghostTrace = []; // [{t,x,y}]
+let ghostPlayback = []; // копия прошлого трека
+let t0 = 0;
+
+// Платформы и объекты
+const platforms = [];
+const springs = [];
+const holes = []; // черные дыры
+
+// Мультиплеер
+const net = { ws:null, id:null, room:'public', others:new Map() };
+const statusEl = document.getElementById('status');
+const raceBarEl = document.getElementById('raceBar');
+
+// Ввод
+const keys = { left:false, right:false };
+window.addEventListener('keydown', e=>{
+  if (['ArrowLeft','a','A'].includes(e.key)) keys.left = true;
+  if (['ArrowRight','d','D'].includes(e.key)) keys.right = true;
+  if (e.code==='Space') togglePause();
+});
+window.addEventListener('keyup', e=>{
+  if (['ArrowLeft','a','A'].includes(e.key)) keys.left = false;
+  if (['ArrowRight','d','D'].includes(e.key)) keys.right = false;
+});
+
+// Сенсор
+const btnL = document.getElementById('btnLeft');
+const btnR = document.getElementById('btnRight');
+const btnP = document.getElementById('btnPause');
+const press = (el, on)=>{
+  const set=v=>on(v);
+  el.addEventListener('pointerdown',()=>set(true));
+  el.addEventListener('pointerup',()=>set(false));
+  el.addEventListener('pointerleave',()=>set(false));
+  el.addEventListener('pointercancel',()=>set(false));
+};
+press(btnL, v=> keys.left=v);
+press(btnR, v=> keys.right=v);
+btnP.addEventListener('click', togglePause);
+
+function togglePause(){
+  if (gameState===STATE.READY){ start(); return; }
+  if (gameState===STATE.OVER) { reset(); return; }
+  gameState = (gameState===STATE.RUN)?STATE.PAUSE:STATE.RUN;
+}
+
+// Адаптив
+function resize(){
+  const rect = canvas.parentElement.getBoundingClientRect();
+  W = Math.round(rect.width / 2);
+  H = Math.round(rect.height / 2);
+  canvas.width = Math.floor(rect.width * DPR);
+  canvas.height = Math.floor(rect.height * DPR);
+  ctx.setTransform(DPR,0,0,DPR,0,0);
+}
+window.addEventListener('resize', resize, { passive:true });
+
+// ====== Уровень ======
+function initLevel(){
+  platforms.length = 0; springs.length = 0; holes.length = 0;
+  let y = H - 40;
+  const startX = (W/2) - PLATFORM_WIDTH/2;
+  platforms.push({x:startX,y,w:PLATFORM_WIDTH,h:PLATFORM_HEIGHT,type:'static',vx:0});
+  const n = 26;
+  for (let i=1;i<n;i++){
+    const gap = rand(PLATFORM_GAP_MIN, PLATFORM_GAP_MAX);
+    y -= gap;
+    const w = PLATFORM_WIDTH + (Math.random()*20 - 10);
+    const x = Math.random() * (W - w);
+    let type = 'static';
+    const r = Math.random();
+    if (i>PLATFORM_SAFE_STARTS && r<0.12) type='move';
+    else if (i>PLATFORM_SAFE_STARTS && r<0.22) type='break';
+    const vx = type==='move' ? (Math.random()<0.5?-80:80) : 0;
+    platforms.push({x,y,w,h:PLATFORM_HEIGHT,vx,type});
+    if (type!=='break' && Math.random()<0.12) springs.push({x:x+w*0.5-9,y:y-8,w:18,h:8});
+    if (i>PLATFORM_SAFE_STARTS && Math.random()<0.06) holes.push({x:x+w*0.5,y:y-18,r:11});
+  }
+}
+
+function addPlatformsAbove(){
+  while(platforms.length<30){
+    const topY = Math.min(...platforms.map(p=>p.y));
+    const gap = rand(PLATFORM_GAP_MIN, PLATFORM_GAP_MAX);
+    const y = topY - gap;
+    const w = PLATFORM_WIDTH + (Math.random()*20 - 10);
+    const x = Math.random() * (W - w);
+    let type = Math.random()<0.15 ? 'move' : (Math.random()<0.22 ? 'break':'static');
+    const vx = type==='move' ? (Math.random()<0.5?-90:90) : 0;
+    platforms.push({x,y,w,h:PLATFORM_HEIGHT,vx,type});
+    if (type!=='break' && Math.random()<0.12) springs.push({x:x+w*0.5-9,y:y-8,w:18,h:8});
+    if (Math.random()<0.06) holes.push({x:x+w*0.5,y:y-18,r:11});
+  }
+}
+
+// ====== Сброс / старт ======
+function reset(){
+  bestHeight = 0; cameraY = 0; gameState = STATE.READY;
+  player.x = W/2-16; player.y = H-80; player.vx=0; player.vy=0; player.facing=1; player.glowPhase=0;
+  initLevel(); addPlatformsAbove();
+  ghostPlayback = ghostTrace.slice();
+  t0 = performance.now();
+}
+function start(){
+  if (gameState!==STATE.READY) return;
+  player.vy = -JUMP_SPEED; gameState = STATE.RUN; t0 = performance.now(); ghostTrace = [];
+  startMusicOnce();
+}
+
+// ====== Обновление ======
+let last = performance.now();
+function loop(t){
+  const dt = Math.min(0.033, (t-last)/1000); last = t;
+  if (gameState===STATE.RUN) update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+function update(dt){
+  // управление
+  let ax=0;
+  if (keys.left){ ax -= MOVE_ACCEL; player.facing=-1; }
+  if (keys.right){ ax += MOVE_ACCEL; player.facing=1; }
+  if (!keys.left && !keys.right){
+    if (player.vx>0) player.vx = Math.max(0, player.vx - FRICTION*dt);
+    else if (player.vx<0) player.vx = Math.min(0, player.vx + FRICTION*dt);
+  } else {
+    player.vx = clamp(player.vx + ax*dt, -MOVE_MAX_SPEED, MOVE_MAX_SPEED);
+  }
+
+  // двигаем платформы
+  for (const p of platforms){
+    if (p.type==='move'){
+      p.x += p.vx*dt;
+      if (p.x<0){ p.x=0; p.vx*=-1; }
+      if (p.x+p.w>W){ p.x=W-p.w; p.vx*=-1; }
+    }
+  }
+
+  // физика
+  player.vy += GRAVITY*dt;
+  player.x += player.vx*dt;
+  player.y += player.vy*dt;
+  if (player.x < -player.w) player.x = W;
+  if (player.x > W) player.x = -player.w;
+
+  // столкновения
+  if (player.vy>0){
+    for (let i=0;i<platforms.length;i++){
+      const p = platforms[i];
+      const nx1=player.x, nx2=player.x+player.w;
+      const px1=p.x, px2=p.x+p.w, py1=p.y;
+      const ny2=player.y+player.h, ny2Prev = ny2 - player.vy*dt;
+      const over = nx2>px1 && nx1<px2;
+      const crossTop = ny2Prev<=py1 && ny2>=py1;
+      if (over && crossTop){
+        player.y = py1 - player.h; player.vy = -JUMP_SPEED;
+        const spring = springs.find(s=> s.y===p.y-8 && s.x>=p.x-5 && s.x<=p.x+p.w-10);
+        if (spring){ player.vy = -SUPER_JUMP; fxSpring(spring); }
+        if (p.type==='break'){ platforms.splice(i,1); i--; fxBreak(px1,py1,p.w); }
+      }
+    }
+  }
+
+  // чёрные дыры
+  for (const h of holes){
+    const dx = player.x + player.w/2 - h.x;
+    const dy = player.y + player.h/2 - h.y;
+    const d = Math.hypot(dx,dy);
+    if (d < h.r+10){
+      fxTeleport(h.x,h.y);
+      const upper = platforms.filter(p=> p.y < player.y - 120);
+      if (upper.length){
+        const p = upper[Math.floor(Math.random()*upper.length)];
+        player.x = p.x + p.w/2 - player.w/2;
+        player.y = p.y - player.h - 2;
+        player.vy = -JUMP_SPEED*0.8;
+      }
+    }
+  }
+
+  // камера
+  cameraY = Math.min(cameraY, player.y - H*0.4);
+
+  // чистка и добавление
+  const lowest = cameraY + H + 80;
+  for (let i=platforms.length-1;i>=0;i--) if (platforms[i].y>lowest) platforms.splice(i,1);
+  for (let i=springs.length-1;i>=0;i--) if (springs[i].y>lowest) springs.splice(i,1);
+  for (let i=holes.length-1;i>=0;i--) if (holes[i].y>lowest) holes.splice(i,1);
+  addPlatformsAbove();
+
+  // прогресс
+  const height = Math.max(0, -(player.y - (H - 80)));
+  bestHeight = Math.max(bestHeight, height);
+  const progress = clamp(bestHeight / TARGET_HEIGHT, 0, 1);
+  raceBarEl.style.width = (progress*100).toFixed(1)+'%';
+
+  // смерть при падении
+  if (player.y - cameraY > H + 60){
+    // фиксируем трек, переходим в OVER
+    ghostPlayback = ghostTrace.slice();
+    gameState = STATE.OVER;
+    setTimeout(()=>reset(), 700); // мягкий рестарт
+  }
+
+  // призрачный трек
+  const tRel = (performance.now()-t0)/1000;
+  ghostTrace.push({t:tRel, x:player.x, y:player.y});
+  if (ghostTrace.length>6000) ghostTrace.shift();
+
+  // сеть
+  netTick(tRel);
+}
+
+// ====== Рендер ======
+function render(){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.save();
+  ctx.scale(canvas.width/(canvas.clientWidth||1), canvas.height/(canvas.clientHeight||1));
+
+  drawBackground();
+  for (const p of platforms) drawPlatform(p);
+  for (const s of springs) drawSpring(s);
+  for (const h of holes) drawHole(h);
+
+  drawGhost();
+  drawOthers();
+  drawPlayer();
+  drawHUD();
+
+  ctx.restore();
+}
+
+// Vaporwave фон + линия горизонта + мягкая анимация
+let bgT = 0;
+function drawBackground(){
+  bgT += 0.003;
+  const t = bgT;
+  // плавная смена цветов
+  const top = hsvToRgb(300 + 20*Math.sin(t*0.7), 50, 25);
+  const mid = hsvToRgb(210 + 30*Math.sin(t*0.9+1.2), 60, 35);
+  const bot = hsvToRgb(330 + 25*Math.cos(t*0.6+0.7), 65, 18);
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0, `rgb(${top.r},${top.g},${top.b})`);
+  g.addColorStop(0.55, `rgb(${mid.r},${mid.g},${mid.b})`);
+  g.addColorStop(1, `rgb(${bot.r},${bot.g},${bot.b})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,W,H);
+  // звёздочки
+  ctx.save(); ctx.globalAlpha=0.25;
+  const seed = Math.floor(cameraY*0.08);
+  for (let i=0;i<70;i++){
+    const x=(i*53+seed*19)%W; const y=(i*97+seed*31)%H;
+    ctx.fillStyle = i%3 ? 'rgba(255,240,255,.9)' : 'rgba(200,240,255,.9)';
+    ctx.fillRect(x,y,1.8,1.8);
+  }
+  ctx.restore();
+  // горизонта тёмная линия
+  ctx.fillStyle = 'rgba(5,8,20,.8)';
+  ctx.fillRect(0, H-24, W, 24);
+}
+
+function drawPlatform(p){
+  const y=p.y - cameraY; if (y<-PLATFORM_HEIGHT||y>H+PLATFORM_HEIGHT) return;
+  ctx.beginPath(); roundRect(ctx,p.x,y,p.w,p.h,6);
+  const grad=ctx.createLinearGradient(0,y,0,y+p.h);
+  grad.addColorStop(0,'rgba(56,189,248,0.9)');
+  grad.addColorStop(1,'rgba(167,139,250,0.9)');
+  ctx.fillStyle=grad; ctx.fill();
+  ctx.strokeStyle='rgba(255,255,255,0.4)'; ctx.lineWidth=1; ctx.stroke();
+  if (p.type==='move'){ ctx.globalAlpha=.5; ctx.fillStyle='#fff'; ctx.fillRect(p.x+p.w/2-6, y+2, 12, p.h-4); ctx.globalAlpha=1; }
+  if (p.type==='break'){ ctx.globalAlpha=.3; ctx.strokeStyle='#fca5a5'; ctx.strokeRect(p.x+2,y+2,p.w-4,p.h-4); ctx.globalAlpha=1; }
+}
+function drawSpring(s){ const y=s.y - cameraY; if (y<-20||y>H+20) return; ctx.fillStyle='#9ef99e'; ctx.fillRect(s.x,y,s.w,s.h); ctx.strokeStyle='#166534'; ctx.strokeRect(s.x+0.5,y+0.5,s.w-1,s.h-1); }
+function drawHole(h){ const y=h.y - cameraY; if (y<-30||y>H+30) return; const r=h.r;
+  const grd=ctx.createRadialGradient(h.x,y,0,h.x,y,r);
+  grd.addColorStop(0,'rgba(147,51,234,0.92)');
+  grd.addColorStop(1,'rgba(2,6,23,0.0)');
+  ctx.fillStyle=grd; ctx.beginPath(); ctx.arc(h.x,y,r,0,Math.PI*2); ctx.fill();
+}
+
+// главный персонаж — неоново-розовый с мигающим свечением
+function drawPlayer(){
+  const y=player.y - cameraY;
+  // тень
+  ctx.save(); ctx.globalAlpha=.25; ctx.beginPath(); ctx.ellipse(player.x+player.w/2, y+player.h, player.w*.5, 6, 0,0,Math.PI*2); ctx.fillStyle='#000'; ctx.fill(); ctx.restore();
+
+  // неоновое свечение
+  player.glowPhase += 0.2;
+  const glow = 8 + 3*Math.sin(player.glowPhase*0.2);
+  ctx.save();
+  ctx.shadowBlur = glow * 2;
+  ctx.shadowColor = 'rgba(255, 64, 160, 0.9)'; // неоновый розовый
+  const grad = ctx.createLinearGradient(player.x,y,player.x,y+player.h);
+  grad.addColorStop(0,'#ff77d9');
+  grad.addColorStop(1,'#ff2ea8');
+  ctx.fillStyle=grad;
+  roundRect(ctx,player.x,y,player.w,player.h,8); ctx.fill();
+  ctx.restore();
+
+  // глаз
+  ctx.fillStyle='#081024';
+  const eyeX=player.x + (player.facing===1? player.w*.65: player.w*.35);
+  const eyeY=y+player.h*.35;
+  ctx.beginPath(); ctx.arc(eyeX,eyeY,3,0,Math.PI*2); ctx.fill();
+}
+
+// бледные разноцветные призраки
+let ghostColor = randomPastel();
+function drawGhost(){
+  if(!ghostPlayback.length) return;
+  const tRel=(performance.now()-t0)/1000;
+  let g = ghostPlayback[0];
+  for (let i=1;i<ghostPlayback.length;i++){ if (ghostPlayback[i].t>tRel){ break; } g = ghostPlayback[i]; }
+  if (!g) return;
+  const y=g.y - cameraY;
+  ctx.save();
+  ctx.globalAlpha=.55;
+  ctx.fillStyle = ghostColor;
+  roundRect(ctx,g.x,y,player.w,player.h,8); ctx.fill();
+  ctx.globalAlpha=.18;
+  for(let k=1;k<=4;k++){
+    const prev = ghostPlayback.find(pt=> pt.t >= tRel - k*0.08);
+    if(!prev) break;
+    const yy=prev.y - cameraY;
+    roundRect(ctx,prev.x,yy,player.w,player.h,8); ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawOthers(){
+  for (const [id,pl] of net.others){
+    const y = pl.y - cameraY;
+    if (y<-50||y>H+50) continue;
+    ctx.save(); ctx.globalAlpha=.6; ctx.fillStyle='rgba(255,255,255,0.65)';
+    roundRect(ctx,pl.x,y,player.w,player.h,8); ctx.fill(); ctx.restore();
+  }
+}
+
+function drawHUD(){
+  ctx.fillStyle='rgba(255,255,255,0.92)';
+  ctx.font='bold 16px Inter, system-ui, -apple-system, Segoe UI, Roboto';
+  ctx.textAlign='left';
+  ctx.fillText(`Высота: ${Math.floor(bestHeight)} / ${TARGET_HEIGHT}`, 10, 22);
+}
+
+// Эффекты
+function fxSpring(s){
+  const y=s.y - cameraY;
+  for(let i=0;i<10;i++){
+    setTimeout(()=>{
+      ctx.save(); ctx.globalAlpha=.25; ctx.fillStyle='#bbf7d0';
+      ctx.beginPath(); ctx.arc(s.x+s.w/2, y, 4+i*2, 0, Math.PI*2); ctx.fill(); ctx.restore();
+    }, i*16);
+  }
+}
+function fxBreak(x,y,w){
+  for(let i=0;i<12;i++){
+    const dx=(Math.random()-.5)*w; const dy=(Math.random()-.2)*18;
+    setTimeout(()=>{
+      ctx.save(); ctx.globalAlpha=.35; ctx.fillStyle='#fecaca';
+      ctx.fillRect(x+w/2+dx, y+dy - cameraY, 2,2); ctx.restore();
+    }, i*12);
+  }
+}
+function fxTeleport(x,y){
+  let t=0; const id=setInterval(()=>{
+    t++; document.body.style.filter = 'brightness('+(1+Math.min(.25,t/8))+') hue-rotate('+(t*12)+'deg)';
+  }, 16);
+  setTimeout(()=>{ clearInterval(id); document.body.style.filter=''; }, 220);
+}
+
+// ====== Сеть ======
+function netConnect(){
+  try {
+    const protocol = (location.protocol==='https:' ? 'wss://' : 'ws://');
+    const urlParam = new URLSearchParams(location.search).get('ws');
+    const url = urlParam || (protocol + location.host);
+    net.ws = new WebSocket(url);
+    net.ws.onopen = ()=>{ statusEl.textContent='WS: online'; net.ws.send(JSON.stringify({type:'hello', room:net.room})); };
+    net.ws.onclose = ()=>{ statusEl.textContent='WS: offline'; };
+    net.ws.onerror = ()=>{ statusEl.textContent='WS: error'; };
+    net.ws.onmessage = (ev)=>{
+      const msg = JSON.parse(ev.data);
+      if (msg.type==='welcome'){ net.id = msg.id; }
+      if (msg.type==='state' && msg.id!==net.id){
+        net.others.set(msg.id, msg.payload);
+        setTimeout(()=> net.others.delete(msg.id), 1000);
+      }
+    };
+  } catch(e){ statusEl.textContent='WS: error'; }
+}
+let netTimer=0;
+function netTick(tRel){
+  if (!net.ws || net.ws.readyState!==1) return;
+  netTimer += 1/60; if (netTimer<1/15) return; netTimer=0;
+  const payload = { x:player.x, y:player.y, facing:player.facing, height:bestHeight };
+  net.ws.send(JSON.stringify({type:'state', room:net.room, payload}));
+}
+
+// ====== Музыка (запуск после первого прыжка) ======
+let audioStarted = false;
+let audioCtx, master, loopNodes = [];
+function startMusicOnce(){
+  if (audioStarted) return;
+  audioStarted = true;
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    master = audioCtx.createGain(); master.gain.value = 0.06; master.connect(audioCtx.destination);
+    startPadLoop();
+  } catch(e) { /* без звука */ }
+}
+function startPadLoop(){
+  // Простой synthwave pad: два детюненных осциллятора + фильтр, аккорды по кругу
+  const chords = [
+    [55, 62, 69],   // A minor (A2, D3, A3)
+    [57, 64, 71],   // Bm
+    [52, 59, 66],   // E
+    [50, 57, 64]    // D
+  ];
+  let step = 0;
+  const tempo = 68; // BPM
+  const beat = 60/tempo;
+  function scheduleChord(){
+    const now = audioCtx.currentTime;
+    const chord = chords[step % chords.length];
+    // создаём для каждой ноты голос
+    chord.forEach((note,i)=>{
+      const f = 440 * Math.pow(2, (note-69)/12);
+      const osc1 = audioCtx.createOscillator();
+      const osc2 = audioCtx.createOscillator();
+      osc1.type='sawtooth'; osc2.type='sawtooth';
+      osc1.frequency.value = f * 0.997;
+      osc2.frequency.value = f * 1.003;
+
+      const gain = audioCtx.createGain();
+      const filter = audioCtx.createBiquadFilter();
+      filter.type='lowpass'; filter.frequency.value = 1200; filter.Q.value = 0.8;
+
+      osc1.connect(filter); osc2.connect(filter);
+      filter.connect(gain); gain.connect(master);
+
+      const t0 = now;
+      const len = beat*4; // такт
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.linearRampToValueAtTime(0.12/(i+1), t0+beat*0.5);
+      gain.gain.linearRampToValueAtTime(0.0001, t0+len);
+
+      osc1.start(t0); osc2.start(t0);
+      osc1.stop(t0+len); osc2.stop(t0+len);
+    });
+    step++;
+    setTimeout(scheduleChord, beat*1000*4);
+  }
+  scheduleChord();
+}
+
+// ====== Утилиты ======
+function rand(min,max){ return Math.random()*(max-min)+min; }
+function clamp(v,lo,hi){ return Math.max(lo, Math.min(hi, v)); }
+function roundRect(ctx,x,y,w,h,r){ const rr=Math.min(r,w/2,h/2); ctx.beginPath(); ctx.moveTo(x+rr,y); ctx.arcTo(x+w,y,x+w,y+h,rr); ctx.arcTo(x+w,y+h,x,y+h,rr); ctx.arcTo(x,y+h,x,y,rr); ctx.arcTo(x,y,x+w,y,rr); ctx.closePath(); }
+function hsvToRgb(h,s,v){ h=((h%360)+360)%360; s=Math.max(0,Math.min(100,s))/100; v=Math.max(0,Math.min(100,v))/100; const c=v*s; const x=c*(1-Math.abs((h/60)%2-1)); const m=v-c; let r=0,g=0,b=0; if(h<60){r=c;g=x;} else if(h<120){r=x;g=c;} else if(h<180){g=c;b=x;} else if(h<240){g=x;b=c;} else if(h<300){r=x;b=c;} else {r=c;b=x;} return {r:Math.round((r+m)*255), g:Math.round((g+m)*255), b:Math.round((b+m)*255)}; }
+function randomPastel(){ const h = Math.random()*360; const rgb = hsvToRgb(h, 30, 95); return `rgba(${rgb.r},${rgb.g},${rgb.b},0.55)`; }
+
+// ====== Старт ======
+function main(){
+  resize(); reset(); netConnect();
+  (function raf(){ requestAnimationFrame(loop); })();
+}
+main();
+</script>
+</body>
+</html>
